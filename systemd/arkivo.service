@@ -1,0 +1,16 @@
+[Unit]
+Description=arkivo - jalankan job backup yang jatuh tempo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=backup
+Group=backup
+WorkingDirectory=/var/www/arkivo
+Environment=ARKIVO_CONFIG=/var/www/arkivo/config.toml
+# pg_dump/psql butuh PATH yang sama seperti shell login
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /var/www/arkivo/arkivo.py tick
+# job panjang: matikan timeout default
+TimeoutStartSec=infinity

@@ -1,0 +1,18 @@
+[Unit]
+Description=arkivo dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=backup
+Group=backup
+WorkingDirectory=/var/www/arkivo
+Environment=ARKIVO_CONFIG=/var/www/arkivo/config.toml
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /var/www/arkivo/arkivo.py serve
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

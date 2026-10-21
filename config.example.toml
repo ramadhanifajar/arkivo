@@ -1,0 +1,139 @@
+# arkivo config. Salin jadi config.toml lalu sesuaikan.
+[general]
+data_dir = "/var/www/arkivo/data"   # state.db, tmp, dan target lokal default
+retention_days = 14                    # default kalau job tidak set sendiri
+min_free_percent = 15                  # notif kalau storage target sisa di bawah ini
+dashboard_port = 8787
+dashboard_host = "127.0.0.1"           # jangan diubah kecuali di belakang reverse proxy
+dashboard_token = ""                   # kosong = dibuat acak tiap start
+
+[telegram]
+# bot_token = "123456:ABC..."          # dari @BotFather
+# chat_id = "-1001234567890"
+bot_token = ""
+chat_id = ""
+
+# ---------------------------------------------------------------- target
+# Semua target terima SATU file arsip. Tidak pernah pohon file -> upload andal.
+[[targets]]
+name = "Local"
+type = "local"
+path = "/var/www/arkivo/data/local"
+
+[[targets]]
+name = "Google Drive"
+type = "rclone"
+path = "gdrive:backup/server1"         # remote rclone, sudah ada di mesin ini
+enabled = false
+
+[[targets]]
+name = "SMB"
+type = "rclone"
+path = "winserver:backup/server1"      # SMB lewat rclone remote bernama winserver
+enabled = false
+
+[[targets]]
+name = "S3 Compatible"
+type = "rclone"
+path = "s3remote:bucket/backup"        # S3-compatible: rclone config => provider s3
+enabled = false
+
+[[targets]]
+name = "SSH/SFTP"
+type = "rclone"
+path = "sshnas:/mnt/backup"            # rclone remote bertipe sftp
+enabled = false
+
+# NFS bukan backend rclone: mount dulu di level OS, lalu perlakukan sebagai lokal.
+#   /etc/fstab:  10.0.0.20:/export/backup  /mnt/nfs/backup  nfs  defaults,_netdev  0 0
+[[targets]]
+name = "NFS"
+type = "local"
+path = "/mnt/nfs/backup"
+enabled = false
+
+# ---------------------------------------------------------------- job
+# Format jadwal yang didukung (juga bisa diubah dari dashboard):
+#   "manual"            hanya lewat tombol / CLI
+#   "every30m" "every6h"  tiap N menit/jam (setelah run terakhir)
+#   "hourly"
+#   "daily 02:00"
+#   "weekly 6 23:00"    gaya crontab: 0=Minggu .. 6=Sabtu
+# Perubahan dari dashboard disimpan di data/state.db dan MENANG atas file ini —
+# config.toml tidak pernah ditulis ulang, jadi komentar dan password tetap utuh.
+#
+# BEBERAPA DATABASE: isi databases = ["app", "crm"] — satu job menangani beberapa
+#   database. Tiap database jadi satu berkas arsip sendiri.
+# BEBERAPA SERVER: bikin [[job]] terpisah per server (host berbeda), atau pakai
+#   transport = "ssh" kalau arkivo ada di mesin lain dan sumbernya di server jauh.
+
+[[job]]
+name = "pg-main"
+type = "postgres"
+host = "127.0.0.1"
+port = 5432
+user = "postgres"
+password = ""                          # kosongkan kalau pakai .pgpass / peer auth
+databases = ["*"]                      # semua database non-template
+schedule = "daily 02:00"
+retention_days = 14
+timeout = 3600
+
+# server database lain: cukup tambah job dengan host berbeda
+# [[job]]
+# name = "pg-prod-01"
+# type = "postgres"
+# host = "10.0.0.5"                    # server lain, port 5432 harus terjangkau
+# user = "backup_user"
+# password = "rahasia"
+# databases = ["app", "crm", "billing"]  # beberapa database sekaligus
+# schedule = "daily 04:00"
+# retention_days = 30
+
+[[job]]
+name = "mysql-main"
+type = "mysql"
+host = "127.0.0.1"
+port = 3306
+user = "root"
+password = ""
+databases = ["*"]                      # atau ["db1", "db2"]
+schedule = "daily 02:30"
+retention_days = 14
+
+[[job]]
+name = "webapp-files"
+type = "path"
+path = "/var/www/arkivo"            # repo / full project
+exclude = [".git/objects", "node_modules", "vendor", "data/tmp", "data/local"]
+# config.toml, data/secrets.json, data/state.db milik arkivo selalu dikecualikan
+# otomatis (berisi password) — tidak perlu ditulis di sini.
+schedule = "daily 03:00"
+retention_days = 7
+
+# project di server LAIN, diambil lewat ssh (tak perlu mount/agent di sana)
+# [[job]]
+# name = "web-prod"
+# type = "path"
+# transport = "ssh"
+# ssh_host = "10.0.0.9"
+# ssh_user = "root"
+# ssh_key = "/root/.ssh/id_ed25519"     # opsional kalau pakai kunci default/ssh-agent
+# path = "/var/www/app"
+# exclude = ["node_modules", ".git"]
+# schedule = "every6h"
+# retention_days = 14
+#
+# database di server LAIN, lewat terowongan ssh (otomatis dibuat saat job jalan)
+# [[job]]
+# name = "db-prod-01"
+# type = "postgres"
+# transport = "ssh"
+# ssh_host = "10.0.0.9"
+# ssh_user = "root"
+# host = "127.0.0.1"                   # host yang dilihat DARI server ssh itu
+# port = 5432
+# user = "backup_user"
+# password = "rahasia"
+# databases = ["*"]
+# schedule = "daily 05:00"

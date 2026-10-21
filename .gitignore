@@ -1,0 +1,16 @@
+# rahasia runtime — jangan pernah di-commit
+config.toml
+data/
+*.db
+secrets.json
+
+# hasil / sampah
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# screenshot lokal (berisi nama job & IP internal)
+image.png
+image copy.png
+image copy 2.png

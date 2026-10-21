@@ -1,0 +1,11 @@
+[Unit]
+Description=Cek job arkivo tiap 5 menit
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# hindari menit :00 yang padat
+RandomizedDelaySec=45
+
+[Install]
+WantedBy=timers.target
