@@ -55,10 +55,30 @@ check("every6h: 7 jam -> due", arkivo.due(jh, (now - timedelta(hours=7)).isoform
 check("every6h next_run", arkivo.next_run(jh, now.isoformat(), now) == now + timedelta(hours=6))
 check("every0m ditolak (bukan pola)", arkivo.every_delta("every0m") is None)
 check("everyabcm ditolak", arkivo.every_delta("everyabc m") is None)
+# jam di luar 0..23 dulu lolos validasi lalu mematikan /api/status
+check("jadwal daily 24:00 ditolak",
+      arkivo.validate_job({"name": "x", "type": "path", "path": "/tmp",
+                           "schedule": "daily 24:00"})[1] is not None)
+check("jadwal daily 12:60 ditolak",
+      arkivo.validate_job({"name": "x", "type": "path", "path": "/tmp",
+                           "schedule": "daily 12:60"})[1] is not None)
+check("jadwal weekly 7 ditolak",
+      arkivo.validate_job({"name": "x", "type": "path", "path": "/tmp",
+                           "schedule": "weekly 7 23:00"})[1] is not None)
+check("jadwal daily 23:59 diterima",
+      arkivo.validate_job({"name": "x", "type": "path", "path": "/tmp",
+                           "schedule": "daily 23:59"})[1] is None)
+old_last = (now - timedelta(days=1)).isoformat()
+check("due: jadwal rusak tidak crash", arkivo.due({"schedule": "daily 24:00"}, old_last, now) is False)
+check("next_run: jadwal rusak -> None",
+      arkivo.next_run({"schedule": "daily 24:00"}, old_last, now) is None)
 
 # --- helper ---------------------------------------------------------------
 check("human 0", arkivo.human(0) == "0B")
 check("human 1536", arkivo.human(1536) == "1.5KB")
+check("human_delta 45 detik", arkivo.human_delta(45) == "45s")
+check("human_delta 90 menit", arkivo.human_delta(5400) == "1j 30m")
+check("human_delta 2 jam", arkivo.human_delta(7200) == "2j")
 check("mysql_dump_bin ketemu", arkivo.mysql_dump_bin() in ("mysqldump", "mariadb-dump"))
 
 # --- invarian biner postgres ---------------------------------------------
@@ -266,6 +286,12 @@ with tempfile.TemporaryDirectory() as td:
     cfg = {"general": {"data_dir": Path(td) / "data"},
            "job": [{"name": "dari-config", "type": "path", "path": td}]}
     con = arkivo.connect(cfg)
+    try:
+        arkivo.save_override(con, "job", "dari-config", "schedule", "daily 24:00")
+        bad_sched = False
+    except ValueError:
+        bad_sched = True
+    check("override jadwal rusak ditolak", bad_sched)
     job, err = arkivo.validate_job({"name": "dari-dashboard", "type": "path", "path": td})
     check("validasi job baru", err is None, err or "")
     check("simpan job baru", arkivo.upsert_db_job(con, "dari-dashboard", job) is None)

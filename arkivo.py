@@ -373,6 +373,11 @@ def save_override(con, kind, name, field, value):
         raise ValueError(f"field '{field}' tidak boleh diubah dari dashboard")
     if kind == "general" and field == "lang" and str(value) not in ("en", "id"):
         raise ValueError("bahasa harus 'en' atau 'id'")
+    if kind == "job" and field == "schedule":
+        # jadwal bisa diubah lewat /api/settings juga, bukan hanya form edit job
+        value = str(value).strip().lower()
+        if not SCHEDULE_RE.match(value):
+            raise ValueError("jadwal tidak dikenal (contoh: daily 02:00, weekly 6 23:00)")
     if kind == "target" and field == "path":
         # jalur ini dipakai upload/retention: rclone butuh remote:path, lokal absolut
         value = str(value).strip()
@@ -401,6 +406,11 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,59}$")
 HOST_RE = re.compile(r"^[a-zA-Z0-9._:-]+$")          # hostname / IP / alamat ssh
 DB_ITEM_RE = re.compile(r"^[a-zA-Z0-9_$.*-]+$")
 USER_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+# jam 0..23 dan menit 0..59: "daily 24:00" dulu lolos dan bikin /api/status error
+# (ValueError dari datetime.replace), sehingga seluruh dashboard ikut mati.
+SCHEDULE_RE = re.compile(
+    r"^(?:manual|hourly|every[1-9]\d*[mh]|daily(?: (?:[01]?\d|2[0-3]):[0-5]\d)?"
+    r"|weekly [0-6](?: (?:[01]?\d|2[0-3]):[0-5]\d)?)$")
 
 
 def validate_job(form, name_override=None):
@@ -424,8 +434,7 @@ def validate_job(form, name_override=None):
 
     # jadwal: pakai parser yang sudah ada, supaya format salah ketahuan sekarang
     sched = (form.get("schedule") or "manual").strip().lower()
-    if sched != "manual" and not (sched == "hourly" or re.match(
-            r"^(every\d+[mh]|daily( \d{1,2}:\d{2})?|weekly [0-6]( \d{1,2}:\d{2})?)$", sched)):
+    if not SCHEDULE_RE.match(sched):
         return None, ("jadwal tidak dikenal (contoh: manual, hourly, every30m, every6h, "
                       "daily 02:00, weekly 6 23:00)")
     job["schedule"] = sched
@@ -885,6 +894,18 @@ def human(n):
         if n < 1024 or unit == "TB":
             return f"{n:.1f}{unit}" if unit != "B" else f"{int(n)}B"
         n /= 1024
+
+
+def human_delta(seconds):
+    """Durasi singkat untuk 'berapa lama lagi' (jam/menit/detik)."""
+    sec = max(0, int(seconds))
+    if sec < 60:
+        return f"{sec}s"
+    m = sec // 60
+    if m < 60:
+        return f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}j {m}m" if m else f"{h}j"
 
 
 def cleanup(path):
@@ -1428,15 +1449,21 @@ def due(job, last_run, now):
     if delta:
         return now - last >= delta
     if sched.startswith("daily"):
-        hh, mm = (sched.split()[1] if len(sched.split()) > 1 else "02:00").split(":")
-        slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        try:
+            hh, mm = (sched.split()[1] if len(sched.split()) > 1 else "02:00").split(":")
+            slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        except (ValueError, IndexError):
+            return False        # jadwal rusak di config/database lama: jangan crash
         return now >= slot and last < slot
     if sched.startswith("weekly"):
-        parts = sched.split()
-        # gaya crontab: 0=Minggu .. 6=Sabtu. Python: 0=Senin .. 6=Minggu.
-        dow = (int(parts[1]) - 1) % 7
-        hh, mm = (parts[2] if len(parts) > 2 else "02:00").split(":")
-        slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        try:
+            parts = sched.split()
+            # gaya crontab: 0=Minggu .. 6=Sabtu. Python: 0=Senin .. 6=Minggu.
+            dow = (int(parts[1]) - 1) % 7
+            hh, mm = (parts[2] if len(parts) > 2 else "02:00").split(":")
+            slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        except (ValueError, IndexError):
+            return False
         slot -= timedelta(days=(now.weekday() - dow) % 7)
         return now.weekday() == dow and now >= slot and last < slot
     return False
@@ -1452,8 +1479,11 @@ def next_run(job, last_run, now):
         base = datetime.fromisoformat(last_run) if last_run else now
         return base + delta
     if sched.startswith("daily"):
-        hh, mm = (sched.split()[1] if len(sched.split()) > 1 else "02:00").split(":")
-        slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        try:
+            hh, mm = (sched.split()[1] if len(sched.split()) > 1 else "02:00").split(":")
+            slot = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        except (ValueError, IndexError):
+            return None
         return slot if slot > now else slot + timedelta(days=1)
     return None
 
@@ -1892,8 +1922,9 @@ def cmd_list(cfg, con):
         nxt = next_run(job, last, now)
         last_s = datetime.fromisoformat(last).strftime("%Y-%m-%d %H:%M") if last else "belum pernah"
         off = "" if job.get("enabled", True) else "  [nonaktif]"
+        sisa = f"dalam {human_delta((nxt - now).total_seconds())}" if nxt else "-"
         print(f"{job['name']:20} {job['type']:9} terakhir={last_s:17} berikutnya="
-              f"{nxt.strftime('%Y-%m-%d %H:%M') if nxt else '-':17} "
+              f"{nxt.strftime('%Y-%m-%d %H:%M') if nxt else '-':17} {sisa:12} "
               f"retensi={job.get('retention_days', 14)}h{off}")
         if job.get("enabled", True) and due(job, last, now):
             print(f"{'':20} ^ JATUH TEMPO")
@@ -2719,6 +2750,7 @@ const ID2EN = {
   'gagal': 'failed',
   'berjalan': 'running',
   'belum pernah': 'never',
+  'dalam': 'in',
   'belum ada': 'none yet',
   'belum ada run': 'no runs yet',
   'belum ada password': 'no password yet',
@@ -3301,6 +3333,8 @@ async function tick(){
         : `${r ? statusChip(r) : `<span class="chip idle"><i class="dot"></i>belum pernah</span>`}
            <div class="meta prog" data-job="${esc(j.name)}">${r ? esc(r.started) : ''}</div>`}
       <td class=dim>${esc(j.next) || '—'}
+        ${j.enabled && j.next_in != null
+          ? `<div class=meta>${tr('dalam')} ${fmtDur(j.next_in)}</div>` : ''}
       <td><div>${esc(j.schedule)}</div>
         <div class="meta">${tr(`simpan ${j.retention_days} hari`)}</div>
       <td><label class=switch><input type=checkbox ${j.enabled?'checked':''}
@@ -3330,7 +3364,9 @@ async function tick(){
         return `<tr><td><div class=jobname style="cursor:default">${esc(j.name)}</div>
           <div class=meta>${esc(j.type)} · ${esc(j.schedule)} · ${tr(`simpan ${j.retention_days} hari`)}</div>
           <td>${r ? statusChip(r) : '<span class="chip idle"><i class="dot"></i>belum pernah</span>'}
-          <td class=dim>${esc(j.next) || '—'}</tr>`;
+          <td class=dim>${esc(j.next) || '—'}
+        ${j.enabled && j.next_in != null
+          ? `<div class=meta>${tr('dalam')} ${fmtDur(j.next_in)}</div>` : ''}</tr>`;
       }).join('') + '</tbody></table></div>'
     : blankState('Belum ada job', 'Tambahkan job dari halaman Job.');
 
@@ -4236,7 +4272,9 @@ matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => {
                                                            c.get("general", {}).get("retention_days", 14)),
                                  "enabled": bool(job.get("enabled", True)),
                                  "last": last[:16].replace("T", " ") if last else None,
-                                 "next": nxt.strftime("%Y-%m-%d %H:%M") if nxt else None})
+                                 "next": nxt.strftime("%Y-%m-%d %H:%M") if nxt else None,
+                                 "next_in": max(0, round((nxt - now).total_seconds()))
+                                            if nxt else None})
                 targets = []
                 for t in c.get("targets", []):
                     disk = target_disk(t) if t.get("enabled", True) else None
