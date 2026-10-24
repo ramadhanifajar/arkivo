@@ -12,6 +12,7 @@ Pengaturan yang diubah dari dashboard disimpan di data/state.db, tidak pernah
 ditulis balik ke config.toml, supaya komentar dan password di file itu tetap utuh.
 """
 import contextlib
+import html
 import json
 import os
 import re
@@ -313,7 +314,7 @@ EDITABLE_JOB_FIELDS = ("schedule", "retention_days", "enabled", "databases")
 # target: nama adalah kunci override, jadi hanya jalur & saklar yang bisa diubah
 EDITABLE_TARGET_FIELDS = ("enabled", "path")
 # telegram: satu blok, disimpan di overrides dengan kind "telegram"
-EDITABLE_TELEGRAM_FIELDS = ("bot_token", "chat_id", "enabled")
+EDITABLE_TELEGRAM_FIELDS = ("bot_token", "chat_id", "enabled", "title")
 # preferensi tampilan dashboard (bukan kredensial), disimpan di overrides juga
 EDITABLE_GENERAL_FIELDS = ("lang",)
 # field yang disimpan sebagai teks tapi harus dibaca sebagai bool. "false" itu truthy.
@@ -393,6 +394,16 @@ def save_override(con, kind, name, field, value):
         value = str(value).strip()
         if value and not re.match(r"^-?\d{1,20}$", value):
             raise ValueError("chat id harus angka (grup diawali tanda minus)")
+    if kind == "telegram" and field == "title":
+        # yang diedit pengguna hanya isi kurungnya; kurung siku tetap dipasang di
+        # sini supaya format pesan konsisten walau API dipanggil langsung
+        value = str(value).strip()
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1].strip()
+        value = value or "Arkivo"
+        if len(value) > 58 or "\n" in value:
+            raise ValueError("judul notifikasi maksimal 58 karakter, satu baris")
+        value = f"[{value}]"
     if field in BOOL_FIELDS:
         value = "true" if str(value).lower() in ("1", "true", "on", "yes") else "false"
     con.execute("INSERT INTO overrides(kind,name,field,value) VALUES(?,?,?,?) "
@@ -690,7 +701,37 @@ def remove_db_job(con, name):
     return cur.rowcount > 0
 
 
+def remove_runs(con, rid=None, status=None):
+    """Hapus baris riwayat. Run yang masih berjalan tidak pernah dihapus."""
+    if rid is not None:
+        cur = con.execute("DELETE FROM runs WHERE id=? AND status!='running'", (int(rid),))
+    elif status == "failed":
+        cur = con.execute("DELETE FROM runs WHERE status='failed'")
+    else:
+        raise ValueError("pilih id atau status='failed'")
+    con.commit()
+    return cur.rowcount
+
+
 # ---------------------------------------------------------------- notifikasi
+
+def cfg_lang(con):
+    """Bahasa yang dipakai log & notifikasi: sama dengan pengaturan dashboard."""
+    try:
+        row = con.execute("SELECT value FROM overrides "
+                          "WHERE kind='general' AND name='' AND field='lang'").fetchone()
+    except sqlite3.Error:
+        return "en"
+    return row[0] if row and row[0] in ("en", "id") else "en"
+
+
+def tg_title(cfg):
+    """Awalan pesan Telegram. Kurung siku dipasang otomatis kalau belum ada."""
+    t = str(cfg.get("telegram", {}).get("title") or "").strip()
+    if t.startswith("[") and t.endswith("]"):
+        return t
+    return f"[{t or 'Arkivo'}]"
+
 
 def notify(cfg, text):
     """Kirim ke Telegram. Mengembalikan None kalau berhasil, pesan error kalau gagal."""
@@ -773,16 +814,47 @@ def _sample_growth(job_name, path, stop, interval=0.5):
             return
 
 
+# Baris log dibuat di server, jadi terjemahannya juga di sini (bukan di browser).
+# Hanya pola pesan milik arkivo; keluaran tool (pg_dump, tar, rclone) dibiarkan apa
+# adanya. Urutan penting: "GAGAL target" sebelum "GAGAL:".
+LOG_EN = [
+    (re.compile(r"^mulai (.+) \((.+)\) tipe=(.+)$"), r"start \1 (\2) type=\3"),
+    (re.compile(r"^dump selesai: (.+)$"), r"dump finished: \1"),
+    (re.compile(r"^target (.+) dimatikan, dilewati$"), r"target \1 disabled, skipped"),
+    (re.compile(r"^terkirim ke (.+): (.+)$"), r"uploaded to \1: \2"),
+    (re.compile(r"^storage (.+): sisa (.+)%$"), r"storage \1: \2% free"),
+    (re.compile(r"^GAGAL target (.+): (.+)$"), r"FAILED target \1: \2"),
+    (re.compile(r"^GAGAL: (.+)$"), r"FAILED: \1"),
+    (re.compile(r"^selesai: (.+) \((.+)s\)$"), r"finished: \1 (\2s)"),
+    (re.compile(r"^reconcile: (\d+) run yatim ditandai gagal$"),
+     r"reconcile: \1 orphan runs marked failed"),
+    (re.compile(r"^password job (.+): diisi$"), r"password job \1: set"),
+    (re.compile(r"^password job (.+): dikosongkan$"), r"password job \1: cleared"),
+    (re.compile(r"^terowongan ssh: (.+)$"), r"ssh tunnel: \1"),
+]
+
+
+def translate_log(line):
+    for rx, rep in LOG_EN:
+        if rx.match(line):
+            return rx.sub(rep, line)
+    return line
+
+
 def log_line(text):
     """Catat satu baris log untuk run yang sedang berjalan (kalau ada).
 
     Setiap baris diberi cap waktu lengkap supaya durasi tiap fase bisa dibaca
-    langsung dari log, bukan hanya total dari kolom riwayat.
+    langsung dari log, bukan hanya total dari kolom riwayat. Bahasanya mengikuti
+    pengaturan dashboard (`_log_ctx.lang`).
     """
     buf = getattr(_log_ctx, "buf", None)
     if buf is not None:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lang = getattr(_log_ctx, "lang", "id")
         for line in str(text).splitlines() or [""]:
+            if lang == "en":
+                line = translate_log(line)
             buf.append(f"[{stamp}] {line}")
 
 
@@ -1490,13 +1562,51 @@ def next_run(job, last_run, now):
 
 # ---------------------------------------------------------------- eksekusi
 
+def claim_run(con, job, started):
+    """Daftarkan run baru sebagai 'running', atau tolak kalau job masih berjalan.
+
+    Antip dobel lintas PROSES: timer (arkivo.py tick) dan dashboard adalah proses
+    berbeda, jadi penjaga di memori (CANCEL) tidak saling melihat. BEGIN IMMEDIATE
+    membuat cek-dan-insert atomik antar proses.
+
+    Baris yatim (proses mati tanpa menutup run) lebih tua dari timeout job dianggap
+    mati dan ditutup sebagai gagal, supaya tidak memblokir selamanya.
+
+    Mengembalikan run_id, atau None kalau job masih berjalan.
+    """
+    name = job["name"]
+    try:
+        con.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        return None     # database sedang dikunci proses lain yang memulai run
+    row = con.execute("SELECT id, started FROM runs WHERE job=? AND finished IS NULL "
+                      "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    if row:
+        timeout = int(job.get("timeout") or 3600) + 600
+        try:
+            age = (datetime.now() - datetime.fromisoformat(row[1])).total_seconds()
+        except (TypeError, ValueError):
+            age = timeout
+        if age < timeout:
+            con.rollback()
+            return None
+        con.execute("UPDATE runs SET finished=?, status='failed', error=?, "
+                    "log=COALESCE(log,'') || ? WHERE id=?",
+                    (started.isoformat(), "terputus: proses sebelumnya tidak menutup run",
+                     f"\n[{started:%Y-%m-%d %H:%M:%S}] GAGAL: run sebelumnya putus, "
+                     f"ditandai gagal sebelum run baru dimulai", row[0]))
+    run_id = con.execute("INSERT INTO runs(job, started, status) VALUES(?,?,?)",
+                         (name, started.isoformat(), "running")).lastrowid
+    con.commit()
+    return run_id
+
+
 def run_job(cfg, job, con, trigger="schedule"):
     name = job["name"]
     started = datetime.now()
-    cur = con.execute(
-        "INSERT INTO runs(job, started, status) VALUES(?,?,?)", (name, started.isoformat(), "running"))
-    run_id = cur.lastrowid
-    con.commit()
+    run_id = claim_run(con, job, started)
+    if run_id is None:
+        return None     # job ini masih berjalan (proses lain atau thread lain)
 
     tmp_dir = data_dir(cfg) / "tmp"
     tmp_dir.mkdir(exist_ok=True)
@@ -1505,7 +1615,9 @@ def run_job(cfg, job, con, trigger="schedule"):
     produced = []
     out = None  # jalur artefak; # diketahui sebelum dump agar bisa dibersihkan saat gagal
     buf = []
+    lang = cfg_lang(con)
     _log_ctx.buf = buf
+    _log_ctx.lang = lang
     _log_ctx.warnings = []
     progress_start(name)
     progress_update(name, buf=buf, phase="menyiapkan")
@@ -1557,8 +1669,15 @@ def run_job(cfg, job, con, trigger="schedule"):
                 if free is not None:
                     log_line(f"storage {target.get('name')}: sisa {free:.1f}%")
                     if free < floor:
-                        notify(cfg, f"⚠️ <b>{name}</b>: storage {target.get('name')} "
-                                    f"sisa {free:.1f}% (batas {floor}%)")
+                        if lang == "id":
+                            txt = (f"{html.escape(tg_title(cfg))} ⚠️ <b>{name}</b>: "
+                                   f"storage {target.get('name')} sisa {free:.1f}% "
+                                   f"(batas {floor}%)")
+                        else:
+                            txt = (f"{html.escape(tg_title(cfg))} ⚠️ <b>{name}</b>: "
+                                   f"storage {target.get('name')} has {free:.1f}% free "
+                                   f"(limit {floor}%)")
+                        notify(cfg, txt)
             except Exception as exc:
                 errors.append(f"{target.get('name', '?')}: {exc}")
                 log_line(f"GAGAL target {target.get('name')}: {exc}")
@@ -1578,6 +1697,7 @@ def run_job(cfg, job, con, trigger="schedule"):
             if p:
                 p.unlink(missing_ok=True)
         _log_ctx.buf = None
+        _log_ctx.lang = None
         _log_ctx.warnings = None
         progress_done(name)
         CANCEL.pop(name, None)
@@ -1585,7 +1705,10 @@ def run_job(cfg, job, con, trigger="schedule"):
     finished = datetime.now()
     dur = (finished - started).total_seconds()
     # ditulis langsung: _log_ctx.buf sudah dilepas di finally
-    buf.append(f"[{finished:%Y-%m-%d %H:%M:%S}] selesai: {status} ({dur:.0f}s)")
+    tail = f"selesai: {status} ({dur:.0f}s)"
+    if lang == "en":
+        tail = translate_log(tail)
+    buf.append(f"[{finished:%Y-%m-%d %H:%M:%S}] {tail}")
     con.execute("UPDATE runs SET finished=?, status=?, artifact=?, bytes=?, error=?, log=? WHERE id=?",
                 (finished.isoformat(), status, ", ".join(uploaded), total_bytes, err_text,
                  "\n".join(buf)[-200_000:], run_id))
@@ -1595,8 +1718,12 @@ def run_job(cfg, job, con, trigger="schedule"):
     con.commit()
 
     icon = {"success": "✅", "partial": "⚠️", "failed": "❌"}[status]
-    msg = (f"{icon} <b>{name}</b> ({trigger})\n"
-           f"status: {status}\nukuran: {human(total_bytes)}\ndurasi: {dur:.0f}s")
+    head = f"{html.escape(tg_title(cfg))} {icon} <b>{name}</b> ({trigger})\n"
+    if lang == "id":
+        st = {"success": "berhasil", "partial": "sebagian", "failed": "gagal"}[status]
+        msg = head + f"status: {st}\nukuran: {human(total_bytes)}\ndurasi: {dur:.0f}s"
+    else:
+        msg = head + f"status: {status}\nsize: {human(total_bytes)}\nduration: {dur:.0f}s"
     if errors:
         msg += "\n\n" + "\n".join(f"• {e[:300]}" for e in errors)
     notify(cfg, msg)
@@ -1939,8 +2066,11 @@ def cmd_tick(cfg, con):
             continue
         row = con.execute("SELECT last_run FROM state WHERE job=?", (job["name"],)).fetchone()
         if due(job, row[0] if row else None, now):
-            print(f"[{now:%H:%M:%S}] jalan: {job['name']}")
-            run_job(cfg, job, con)
+            print(f"[{now:%H:%M:%S}] jalan: {job['name']}", flush=True)
+            if run_job(cfg, job, con) is None:
+                print(f"[{now:%H:%M:%S}] lewati {job['name']}: masih berjalan "
+                      f"di proses lain")
+                continue
             ran += 1
     if not ran:
         print(f"[{now:%H:%M:%S}] tidak ada job jatuh tempo")
@@ -1950,7 +2080,11 @@ def cmd_tick(cfg, con):
 def cmd_run(cfg, con, name):
     for job in cfg.get("job", []):
         if job["name"] == name:
-            status, err = run_job(cfg, job, con, trigger="manual")
+            res = run_job(cfg, job, con, trigger="manual")
+            if res is None:
+                print(f"{name}: sedang berjalan di proses lain", file=sys.stderr)
+                return 1
+            status, err = res
             print(f"{name}: {status}" + (f" — {err}" if err else ""))
             return 0 if status == "success" else 1
     print(f"job tidak ditemukan: {name}", file=sys.stderr)
@@ -2546,7 +2680,8 @@ border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
 
 <section id=v-history hidden>
 <section class=panel>
-<div class=phead><h2>Riwayat</h2><span class=sub>60 run terakhir</span></div>
+<div class=phead><h2>Riwayat</h2><span class=sub>60 run terakhir</span>
+<button class="btn sm danger" id=clearfailed hidden onclick="delFailed()">Hapus yang gagal</button></div>
 <div class=pbody id=runs><div class=skeleton></div></div>
 </section>
 </section>
@@ -2656,6 +2791,7 @@ Jalur target<input type=text id=t_path autocomplete=off spellcheck=false
 <label>Bot token<input type=text id=g_token autocomplete=off spellcheck=false
   placeholder="123456:ABC-DEF…"></label>
 <label>Chat ID<input type=text id=g_chat placeholder="-1001234567890" autocomplete=off></label>
+<label>Judul notifikasi<input type=text id=g_title value="Arkivo" maxlength=58 autocomplete=off></label>
 </div>
 <label style="display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--ink-2)">
 <label class=switch><input type=checkbox id=g_enabled aria-label="Kirim notifikasi"><i></i></label>
@@ -2956,6 +3092,11 @@ const ID2EN = {
   'mengambil progres…': 'fetching progress…',
   'menghubungi server…': 'contacting server…',
   'selesai · ': 'finished · ',
+  'Judul notifikasi': 'Notification title',
+  '(log kosong)': '(empty log)',
+  '(menunggu keluaran…)': '(waiting for output…)',
+  'menyiapkan': 'preparing',
+  'menunggu': 'waiting',
 };
 
 // teks ber-interpolasi tidak bisa exact-match: pola + fungsi
@@ -2968,6 +3109,7 @@ const DYN = [
     m => m[1] + ' success · ' + m[2] + ' partial · ' + m[3] + ' failed'],
   [/^(\\d+) run gagal terakhir$/, m => m[1] + ' recent failed runs'],
   [/^simpan (\\d+) hari$/, m => 'keep ' + m[1] + ' days'],
+  [/^unggah ke (.+)$/, m => 'upload to ' + m[1]],
   [/^([\\d.,]+ \\w+) bebas dari ([\\d.,]+ \\w+)$/, m => m[1] + ' free of ' + m[2]],
   [/^([\\d.,]+ \\w+) bebas · (tersedia|menipis|penuh)$/,
     m => m[1] + ' free · ' + trLabel(m[2])],
@@ -3429,11 +3571,15 @@ async function tick(){
       <td class=num>${esc(r.size)}
       <td class="dim num hide-sm">${fmtDur(r.duration)}
       <td><div class=actions>
-        <button class="btn sm" onclick="showLog(${r.id},'${esc(r.job)}')" title="Lihat log">${icon('log')}</button>
+        <button class="btn sm" title="Lihat log"
+          onclick="${r.running ? `liveLog('${esc(r.job)}')` : `showLog(${r.id},'${esc(r.job)}')`}">${icon('log')}</button>
         ${r.artifacts.length ? `<button class="btn sm" onclick="dl('${esc(r.artifacts[0])}')" title="Unduh arsip">${icon('download')}</button>
          <button class="btn sm danger" onclick="delArt('${esc(r.artifacts[0])}')" title="Hapus arsip">${icon('trash')}</button>` : ''}
+        ${r.running ? '' : `<button class="btn sm danger" onclick="delRun(${r.id})"
+          title="Hapus riwayat">${icon('trash')}</button>`}
         </div></tr>`).join('') + '</table></div>'
     : blankState('Belum ada riwayat', 'Riwayat run akan muncul setelah job pertama berjalan.');
+  clearfailed.hidden = !d.runs.some(r=>r.status === 'failed');
   if(VIEW === 'archives' && !archiveall.querySelector('table')) renderArchives();
   paintProgress();   // tick() menggambar ulang baris: pasang kembali badge proses
 }
@@ -3749,6 +3895,29 @@ async function delArt(f){
   if(!d.ok) toast('Gagal menghapus: '+(d.error||''));
   else { toast('Arsip dihapus.'); if(CURRENT) loadArchives(CURRENT); tick(); }
 }
+async function delRun(id){
+  const ok = await confirmBox({title:'Hapus riwayat?', danger:true, icon:'trash',
+    ok:'Hapus riwayat', msg:'Satu baris riwayat run akan dihapus.',
+    detail:'Arsip yang sudah tersimpan tidak ikut terhapus. Log run ini juga hilang.'});
+  if(!ok) return;
+  const r = await fetch('api/runs/delete',{method:'POST',headers:H(),
+    body:JSON.stringify({id})});
+  const d = await r.json();
+  if(!d.ok) toast('Gagal menghapus: '+(d.error||''));
+  else { toast('Riwayat dihapus.'); tick(); }
+}
+async function delFailed(){
+  const n = STATE.runs.filter(r=>r.status === 'failed').length;
+  const ok = await confirmBox({title:'Hapus riwayat gagal?', danger:true, icon:'trash',
+    ok:'Hapus '+n+' run', msg:`${n} baris riwayat berstatus gagal akan dihapus.`,
+    detail:'Arsip yang sudah tersimpan tidak ikut terhapus.'});
+  if(!ok) return;
+  const r = await fetch('api/runs/delete',{method:'POST',headers:H(),
+    body:JSON.stringify({status:'failed'})});
+  const d = await r.json();
+  if(!d.ok) toast('Gagal menghapus: '+(d.error||''));
+  else { toast(`${d.deleted||0} riwayat dihapus.`); tick(); }
+}
 async function verifyArt(f, bytes){
   const name = f.split('/').pop();
   dlgt.textContent = 'Verifikasi arsip · ' + name;
@@ -4002,7 +4171,7 @@ async function renderArchives(){
 }
 async function showLog(id,job){
   const d = await (await fetch('api/log?id='+id,{headers:H()})).json();
-  dlgt.textContent = 'Log · '+job; showText(d.log || '(log kosong)');
+  dlgt.textContent = tr('Log · ')+job; showText(d.log || tr('(log kosong)'));
   dlg.showModal();
 }
 // ---- progres realtime -------------------------------------------------------
@@ -4013,7 +4182,7 @@ let PROG = {};          // snapshot terakhir dari /api/progress
 let progTimer = null;
 
 function progLine(p){
-  const parts = [p.phase];
+  const parts = [tr(p.phase)];
   if(p.bytes) parts.push(fmtBytes(p.bytes));
   if(p.rate) parts.push(fmtBytes(p.rate) + '/s');
   if(p.est && p.bytes) parts.push('±' + Math.min(99, Math.round(p.bytes / p.est * 100)) + '%');
@@ -4022,7 +4191,7 @@ function progLine(p){
 }
 // versi ringkas untuk kolom tabel: fase + persen + waktu
 function progShort(p){
-  const parts = [p.phase];
+  const parts = [tr(p.phase)];
   if(p.est && p.bytes) parts.push(Math.min(99, Math.round(p.bytes / p.est * 100)) + '%');
   parts.push(fmtDur(p.elapsed));
   return parts.join(' · ');
@@ -4037,7 +4206,7 @@ async function pollProgress(){
   const p = PROG[LIVE];
   if(p && dlg.open){
     dlglive.textContent = progLine(p);
-    dlgb.textContent = p.log || '(menunggu keluaran…)';
+    dlgb.textContent = p.log || tr('(menunggu keluaran…)');
     scrollLog();
     return;
   }
@@ -4048,10 +4217,10 @@ async function pollProgress(){
   const full = await (await fetch('api/log?id='+fresh.id,{headers:H()})).json();
   if(LIVE && dlg.open){
     liveline.hidden = false; livefoot.hidden = false;
-    dlglive.textContent = 'selesai · ' + statusLabel(fresh.status) + ' · '
+    dlglive.textContent = tr('selesai · ') + statusLabel(fresh.status) + ' · '
       + fresh.size + ' · ' + fmtDur(fresh.duration);
     document.querySelector('#liveline .dot').classList.remove('run');
-    dlgb.textContent = full.log || '(log kosong)';
+    dlgb.textContent = full.log || tr('(log kosong)');
     scrollLog();
   }
   stopLive();
@@ -4083,12 +4252,12 @@ function stopLive(){
 async function liveLog(job){
   if(dlg.open) dlg.close();
   LIVE = job;
-  dlgt.textContent = 'Proses · ' + job;
+  dlgt.textContent = tr('Proses · ') + job;
   dlgr.hidden = true; dlgr.innerHTML = '';
-  dlgb.hidden = false; dlgb.textContent = 'menghubungi server…';
+  dlgb.hidden = false; dlgb.textContent = tr('menghubungi server…');
   liveline.hidden = false; livefoot.hidden = true;   // Log penuh baru perlu setelah selesai
   document.querySelector('#liveline .dot').classList.add('run');
-  dlglive.textContent = 'mengambil progres…';
+  dlglive.textContent = tr('mengambil progres…');
   dlg.showModal();
   startProgress();
   await pollProgress();
@@ -4111,6 +4280,7 @@ function openTelegram(){
   g_token.placeholder = t.has_token ? 'tersimpan — kosongkan untuk mempertahankan'
                                      : '123456:ABC-DEF…';
   g_chat.value = t.chat_id || '';
+  g_title.value = (t.title || '[Arkivo]').replace(/^\\[|\\]$/g, '');
   g_enabled.checked = t.enabled !== false;
   g_hint.textContent = t.has_token
     ? `Token tersimpan (${t.from_config ? 'config.toml + dashboard' : 'dashboard'}). `
@@ -4128,6 +4298,7 @@ async function saveTelegram(){
   const jobs = [];
   if(token) jobs.push(put('bot_token', token));
   jobs.push(put('chat_id', g_chat.value.trim()));
+  jobs.push(put('title', g_title.value.trim()));
   jobs.push(put('enabled', String(g_enabled.checked)));
   let err = null;
   for(const d of await Promise.all(jobs)) if(!d.ok && !err) err = d.error;
@@ -4285,6 +4456,7 @@ matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => {
                 tg = c.get("telegram", {})
                 telegram = {
                     "chat_id": tg.get("chat_id", ""),
+                    "title": tg_title({"telegram": tg}),
                     # token tidak pernah dikirim ke browser; cukup statusnya
                     "has_token": bool(tg.get("bot_token")),
                     "enabled": str(tg.get("enabled", True)).lower()
@@ -4447,6 +4619,19 @@ matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => {
                     return
                 self._json({"ok": True})
                 return
+            if url.path == "/api/runs/delete":
+                b = self._body()
+                rid = b.get("id")
+                db = self._db()
+                try:
+                    deleted = remove_runs(db, rid, b.get("status"))
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "error": "pilih id atau status='failed'"}, 400)
+                    return
+                finally:
+                    db.close()
+                self._json({"ok": True, "deleted": deleted})
+                return
             if url.path == "/api/settings":
                 b = self._body()
                 try:
@@ -4497,8 +4682,11 @@ matchMedia('(prefers-color-scheme:dark)').addEventListener('change', () => {
                                 "error": "bot token / chat id belum diisi"})
                     return
                 # tes harus tetap jalan walau notifikasi otomatis dimatikan
-                err = notify({**c, "telegram": {**tg, "enabled": True}},
-                             "✅ Tes dari dashboard arkivo — notifikasi berfungsi.")
+                head = html.escape(tg.get("title") or "[Arkivo]")
+                text = (f"{head} ✅ Tes dari dashboard arkivo — notifikasi berfungsi."
+                        if self._lang() == "id" else
+                        f"{head} ✅ Test from the arkivo dashboard — notifications work.")
+                err = notify({**c, "telegram": {**tg, "enabled": True}}, text)
                 self._json({"ok": err is None, "error": err})
                 return
             self._json({"error": "not found"}, 404)

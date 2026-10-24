@@ -292,6 +292,68 @@ with tempfile.TemporaryDirectory() as td:
     except ValueError:
         bad_sched = True
     check("override jadwal rusak ditolak", bad_sched)
+    check("bahasa default: en", arkivo.cfg_lang(con) == "en")
+    arkivo.save_override(con, "general", "", "lang", "id")
+    check("bahasa ikut pengaturan dashboard", arkivo.cfg_lang(con) == "id")
+    try:
+        arkivo.save_override(con, "telegram", "main", "title", "x" * 61)
+        bad_title = False
+    except ValueError:
+        bad_title = True
+    check("judul telegram terlalu panjang ditolak", bad_title)
+    arkivo.save_override(con, "telegram", "main", "title", "[My Backup]")
+    check("judul telegram tersimpan",
+          con.execute("SELECT value FROM overrides WHERE kind='telegram' "
+                      "AND field='title'").fetchone()[0] == "[My Backup]")
+    arkivo.save_override(con, "telegram", "main", "title", "My Backup")
+    check("kurung siku dipasang otomatis",
+          con.execute("SELECT value FROM overrides WHERE kind='telegram' "
+                      "AND field='title'").fetchone()[0] == "[My Backup]")
+    arkivo.save_override(con, "telegram", "main", "title", "[]")
+    check("judul kosong kembali ke default",
+          con.execute("SELECT value FROM overrides WHERE kind='telegram' "
+                      "AND field='title'").fetchone()[0] == "[Arkivo]")
+    # hapus riwayat: run berjalan dilindungi, hapus massal hanya status gagal
+    ins = ("INSERT INTO runs(job, started, finished, status) "
+           "VALUES('j','2026-01-01T00:00:00',?,?)")
+    rid_run = con.execute(ins, (None, "running")).lastrowid
+    rid_fail = con.execute(ins, ("2026-01-01T00:00:05", "failed")).lastrowid
+    con.execute(ins, ("2026-01-01T00:00:05", "success"))
+    con.commit()
+    check("riwayat: run berjalan tidak terhapus", arkivo.remove_runs(con, rid_run) == 0)
+    check("riwayat: hapus satu baris gagal", arkivo.remove_runs(con, rid_fail) == 1)
+    con.execute(ins, ("2026-01-01T00:00:06", "failed"))
+    con.execute(ins, ("2026-01-01T00:00:07", "failed"))
+    con.commit()
+    check("riwayat: hapus massal yang gagal", arkivo.remove_runs(con, status="failed") == 2)
+    check("riwayat: status sukses tidak ikut terhapus",
+          con.execute("SELECT COUNT(*) FROM runs WHERE status='success'").fetchone()[0] == 1)
+    try:
+        arkivo.remove_runs(con)
+        bad_runs = False
+    except ValueError:
+        bad_runs = True
+    check("riwayat: tanpa id/status ditolak", bad_runs)
+    # klaim run: satu job tidak boleh jalan dobel, termasuk lintas proses
+    job_c = {"name": "jclaim", "type": "path", "timeout": 10}
+    rid = arkivo.claim_run(con, job_c, datetime.now())
+    check("klaim: run pertama diterima", rid is not None)
+    check("klaim: run kedua ditolak saat masih berjalan",
+          arkivo.claim_run(con, job_c, datetime.now()) is None)
+    con.execute("UPDATE runs SET finished=?, status='success' WHERE id=?",
+                (datetime.now().isoformat(), rid))
+    con.commit()
+    check("klaim: boleh setelah run selesai",
+          arkivo.claim_run(con, job_c, datetime.now()) is not None)
+    con.execute("INSERT INTO runs(job,started,status) VALUES('jstale',?,'running')",
+                ((datetime.now() - timedelta(hours=2)).isoformat(),))
+    con.commit()
+    rid_stale = arkivo.claim_run(con, {"name": "jstale", "type": "path",
+                                       "timeout": 1}, datetime.now())
+    check("klaim: run yatim tidak memblokir", rid_stale is not None)
+    check("klaim: run yatim ditandai gagal",
+          con.execute("SELECT status FROM runs WHERE job='jstale' AND id!=?",
+                      (rid_stale,)).fetchone()[0] == "failed")
     job, err = arkivo.validate_job({"name": "dari-dashboard", "type": "path", "path": td})
     check("validasi job baru", err is None, err or "")
     check("simpan job baru", arkivo.upsert_db_job(con, "dari-dashboard", job) is None)
@@ -488,6 +550,24 @@ check("log: cap waktu tanggal + jam",
       bool(re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] halo$", lb[0]))
       and bool(re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] dunia$", lb[1])),
       str(lb))
+# log mengikuti bahasa dashboard
+check("log EN: mulai", arkivo.translate_log("mulai x (dashboard) tipe=path")
+      == "start x (dashboard) type=path")
+check("log EN: terkirim", arkivo.translate_log("terkirim ke Local: a.tar.zst")
+      == "uploaded to Local: a.tar.zst")
+check("log EN: selesai", arkivo.translate_log("selesai: success (8s)")
+      == "finished: success (8s)")
+check("log EN: keluaran tool dibiarkan", arkivo.translate_log("tar: removing leading /")
+      == "tar: removing leading /")
+arkivo._log_ctx.buf = lb2 = []
+arkivo._log_ctx.lang = "en"
+arkivo.log_line("dump selesai: 1.2MB")
+arkivo._log_ctx.buf = None
+arkivo._log_ctx.lang = None
+check("log_line memakai bahasa", lb2[0].endswith("] dump finished: 1.2MB"), str(lb2))
+check("judul telegram default", arkivo.tg_title({}) == "[Arkivo]")
+check("judul telegram custom",
+      arkivo.tg_title({"telegram": {"title": "[My Backup]"}}) == "[My Backup]")
 # parsing statistik rclone
 for line, want in (("  1.234 MiB / 10 MiB, 12%, 1.5 MiB/s, ETA 5s", 1293942),
                    ("Transferred: 5.678 MiB / 10 MiB, 57%, 2.0 MiB/s", 5953814),

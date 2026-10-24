@@ -12,6 +12,7 @@ dashboard_token = ""                   # kosong = dibuat acak tiap start
 # chat_id = "-1001234567890"
 bot_token = ""
 chat_id = ""
+title = "[Arkivo]"                     # awalan pesan Telegram; bisa diganti "[My Backup]"
 
 # ---------------------------------------------------------------- target
 # Semua target terima SATU file arsip. Tidak pernah pohon file -> upload andal.
