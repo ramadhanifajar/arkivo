@@ -539,17 +539,26 @@ def edit_job(cfg, con, name, form):
 
 
 def remove_job(cfg, con, name):
-    """Hapus job bila job itu dari dashboard. Job config.toml tidak bisa dihapus."""
-    if not remove_db_job(con, name):
-        # job config: catat supaya tidak dijalankan lagi (config tidak ditulis ulang)
-        if any(j.get("name") == name and j.get("_source") != "dashboard"
-               for j in load_jobs(cfg, con).get("job", [])):
-            con.execute("INSERT INTO overrides(kind,name,field,value) VALUES('job',?,?,?) "
-                        "ON CONFLICT(kind,name,field) DO UPDATE SET value=excluded.value",
-                        (name, "_deleted", "true"))
-            con.commit()
-            return True
+    """Hapus job lewat nama tampilan. Job config.toml tidak bisa dihapus, hanya
+    dinonaktifkan.
+
+    Kunci baris di tabel jobs bisa beda dari nama tampilan: job config yang diedit
+    memakai `<nama>__db`, dan job yang diganti nama tetap memakai kunci lamanya.
+    Karena itu cari kuncinya dulu, jangan DELETE dengan nama tampilan.
+    """
+    job = next((j for j in load_jobs(cfg, con).get("job", []) if j.get("name") == name), None)
+    if job is None:
         return False
+    key = job.get("_key") or name
+    if job.get("_source") == "dashboard":
+        remove_db_job(con, key)
+        if not key.endswith("__db"):
+            return True
+        # shim job config: barisnya dibuang, lalu config-nya ditandai terhapus
+    con.execute("INSERT INTO overrides(kind,name,field,value) VALUES('job',?,?,?) "
+                "ON CONFLICT(kind,name,field) DO UPDATE SET value=excluded.value",
+                (name, "_deleted", "true"))
+    con.commit()
     return True
 
 
@@ -3300,7 +3309,7 @@ async function tick(){
         ${j.type != 'path' ? `<button class="btn sm" onclick="pwDialog('${esc(j.name)}',${j.has_password})"
            title="${esc(j.password_from_dashboard ? 'password dari dashboard' : (j.has_password ? 'password dari config.toml / berkas kredensial klien' : 'belum ada password'))}"
            >${icon('key')}</button>` : ''}
-        ${j.source=='dashboard' ? `<button class="btn sm danger" onclick="delJob('${esc(j.name)}')" title="Hapus job">${icon('trash')}</button>` : ''}
+        <button class="btn sm danger" onclick="delJob('${esc(j.name)}')" title="Hapus job">${icon('trash')}</button>
         </div></tr>`;
     }).join('') + '</table></div>'
     : blankState('Belum ada job',

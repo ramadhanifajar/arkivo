@@ -323,6 +323,29 @@ with tempfile.TemporaryDirectory() as td:
           [j["name"] for j in merged["job"]] == ["dari-config", "db-x"],
           str([j["name"] for j in merged["job"]]))
 
+    # hapus lewat nama tampilan: kunci baris bisa beda (rename / shim __db)
+    j3, _ = arkivo.validate_job({"name": "ganti-nama", "type": "postgres", "host": "h",
+                                 "user": "bk", "databases": "*"})
+    arkivo.upsert_db_job(con, "ganti-nama", j3)
+    check("edit: ganti nama job dashboard", arkivo.edit_job(
+        {"job": []}, con, "ganti-nama",
+        {"name": "nama-baru", "type": "postgres", "host": "h", "user": "bk",
+         "databases": "*"})[1] is None)
+    check("hapus: job yang sudah diganti nama", arkivo.remove_job({"job": []}, con, "nama-baru"))
+    check("hapus: baris rename benar-benar hilang",
+          not any(j["name"] == "nama-baru"
+                  for j in arkivo.load_jobs({"job": []}, con)["job"]))
+    arkivo.edit_job(cfg_pw, con, "konf", form)          # bikin baris konf__db
+    check("hapus: job config yang diedit di dashboard", arkivo.remove_job(cfg_pw, con, "konf"))
+    check("hapus: job config hilang dari daftar",
+          not any(j["name"] == "konf" for j in arkivo.load_jobs(cfg_pw, con)["job"]))
+    cfg_murni = {"job": [{"name": "murni", "type": "path", "path": "/tmp"}]}
+    check("hapus: job config tanpa edit", arkivo.remove_job(cfg_murni, con, "murni"))
+    check("hapus: job config tanpa edit hilang",
+          not any(j["name"] == "murni"
+                  for j in arkivo.load_jobs(cfg_murni, con)["job"]),
+          str(arkivo.load_jobs(cfg_murni, con)["job"]))
+
 # --- diagnostik -----------------------------------------------------------
 with tempfile.TemporaryDirectory() as td:
     src = Path(td) / "src"
