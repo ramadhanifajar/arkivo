@@ -765,10 +765,16 @@ def _sample_growth(job_name, path, stop, interval=0.5):
 
 
 def log_line(text):
-    """Catat satu baris log untuk run yang sedang berjalan (kalau ada)."""
+    """Catat satu baris log untuk run yang sedang berjalan (kalau ada).
+
+    Setiap baris diberi cap waktu lengkap supaya durasi tiap fase bisa dibaca
+    langsung dari log, bukan hanya total dari kolom riwayat.
+    """
     buf = getattr(_log_ctx, "buf", None)
     if buf is not None:
-        buf.append(str(text))
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for line in str(text).splitlines() or [""]:
+            buf.append(f"[{stamp}] {line}")
 
 
 def request_cancel(job_name):
@@ -1547,7 +1553,9 @@ def run_job(cfg, job, con, trigger="schedule"):
         CANCEL.pop(name, None)
 
     finished = datetime.now()
-    log_line(f"selesai: {status}")
+    dur = (finished - started).total_seconds()
+    # ditulis langsung: _log_ctx.buf sudah dilepas di finally
+    buf.append(f"[{finished:%Y-%m-%d %H:%M:%S}] selesai: {status} ({dur:.0f}s)")
     con.execute("UPDATE runs SET finished=?, status=?, artifact=?, bytes=?, error=?, log=? WHERE id=?",
                 (finished.isoformat(), status, ", ".join(uploaded), total_bytes, err_text,
                  "\n".join(buf)[-200_000:], run_id))
@@ -1556,7 +1564,6 @@ def run_job(cfg, job, con, trigger="schedule"):
                 (name, finished.isoformat()))
     con.commit()
 
-    dur = (finished - started).total_seconds()
     icon = {"success": "✅", "partial": "⚠️", "failed": "❌"}[status]
     msg = (f"{icon} <b>{name}</b> ({trigger})\n"
            f"status: {status}\nukuran: {human(total_bytes)}\ndurasi: {dur:.0f}s")

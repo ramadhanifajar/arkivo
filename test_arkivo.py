@@ -454,6 +454,14 @@ check("progres: log live ikut terbaca",
       arkivo.progress_snapshot()["job-l"]["log"] == "baris 1\nbaris 2",
       arkivo.progress_snapshot()["job-l"]["log"])
 arkivo.progress_done("job-l")
+# log run: setiap baris ber-cap waktu lengkap (tanggal + jam), termasuk multiline
+arkivo._log_ctx.buf = lb = []
+arkivo.log_line("halo\ndunia")
+arkivo._log_ctx.buf = None
+check("log: cap waktu tanggal + jam",
+      bool(re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] halo$", lb[0]))
+      and bool(re.match(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] dunia$", lb[1])),
+      str(lb))
 # parsing statistik rclone
 for line, want in (("  1.234 MiB / 10 MiB, 12%, 1.5 MiB/s, ETA 5s", 1293942),
                    ("Transferred: 5.678 MiB / 10 MiB, 57%, 2.0 MiB/s", 5953814),
