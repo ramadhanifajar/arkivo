@@ -57,7 +57,8 @@ def connect(cfg):
     con.execute(
         "CREATE TABLE IF NOT EXISTS runs("
         " id INTEGER PRIMARY KEY, job TEXT, started TEXT, finished TEXT,"
-        " status TEXT, artifact TEXT, bytes INTEGER, error TEXT, log TEXT)"
+        " status TEXT, artifact TEXT, bytes INTEGER, error TEXT, log TEXT,"
+        " heartbeat TEXT)"
     )
     con.execute("CREATE TABLE IF NOT EXISTS state(job TEXT PRIMARY KEY, last_run TEXT)")
     # pengaturan yang diubah dari dashboard. Disimpan di sini, BUKAN di config.toml,
@@ -79,6 +80,11 @@ def connect(cfg):
     con.commit()
     if "log" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN log TEXT")
+        con.commit()
+    # heartbeat: proses yang masih hidup memperbarui kolom ini berkala. Run yang
+    # lama tapi heartbeat-nya segar adalah upload lambat, bukan proses mati.
+    if "heartbeat" not in cols:
+        con.execute("ALTER TABLE runs ADD COLUMN heartbeat TEXT")
         con.commit()
     return con
 
@@ -835,10 +841,22 @@ LOG_EN = [
 
 
 def translate_log(line):
+    # Galat internal bisa terselip di dalam baris "GAGAL target ...: ...".
+    # Terjemahkan potongannya lebih dulu, baru awalan barisnya.
+    line = re.sub(
+        r"rclone melebihi batas waktu (\d+)s(?: \(([^)]*)\))?",
+        lambda m: (f"rclone exceeded timeout {m.group(1)}s"
+                   + (f" ({m.group(2)})" if m.group(2) else "")),
+        line)
     for rx, rep in LOG_EN:
         if rx.match(line):
             return rx.sub(rep, line)
     return line
+
+
+def _msg(id_text, en_text):
+    """Pilih pesan internal sesuai bahasa run yang sedang berjalan."""
+    return en_text if getattr(_log_ctx, "lang", "id") == "en" else id_text
 
 
 def log_line(text):
@@ -1395,6 +1413,26 @@ def target_disk(target):
     return hit[1] if hit else None
 
 
+DEFAULT_UPLOAD_TIMEOUT = 6 * 3600
+
+
+def upload_timeout(cfg, target):
+    """Batas total upload satu berkas ke satu target, dalam detik.
+
+    Terpisah dari `timeout` job (batas dump): target cloud bisa jauh lebih lambat
+    daripada dump database. Nilai per target menang atas nilai di [general].
+    """
+    for raw in (target.get("upload_timeout"),
+                cfg.get("general", {}).get("upload_timeout")):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return DEFAULT_UPLOAD_TIMEOUT
+
+
 def upload(cfg, target, local_file, job):
     kind = target.get("type")
     dest = target.get("path", "")
@@ -1411,7 +1449,7 @@ def upload(cfg, target, local_file, job):
                "--stats", "1s", "--stats-one-line", "--stats-log-level", "NOTICE"]
         if target.get("chunker"):
             cmd += ["--transfers", "1"]
-        rc, err = _run_rclone(cmd, job["name"], job.get("timeout", 7200))
+        rc, err = _run_rclone(cmd, job["name"], upload_timeout(cfg, target))
         if rc != 0:
             raise RuntimeError(f"rclone gagal: {err[:1200]}")
         return f"{remote_path}/{local_file.name}"
@@ -1437,6 +1475,7 @@ def _run_rclone(cmd, job_name, timeout):
         entry["procs"].append(proc)
     deadline = time.time() + timeout
     lines = []
+    sent, rate = 0, 0.0
     try:
         for line in proc.stderr:
             lines.append(line.rstrip())
@@ -1445,11 +1484,19 @@ def _run_rclone(cmd, job_name, timeout):
             if "/s" in line:
                 m = _RCLONE_RATE.search(line)
                 if m:
-                    progress_update(job_name, rate=float(m.group(1)) * _UNIT[m.group(2)],
-                                    bytes=_bytes_of(line))
+                    rate = float(m.group(1)) * _UNIT[m.group(2)]
+                    sent = _bytes_of(line) or sent
+                    progress_update(job_name, rate=rate, bytes=sent)
             if time.time() > deadline:
                 proc.kill()
-                raise RuntimeError(f"rclone melebihi batas waktu {timeout}s")
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                detail = f" ({human(sent)}, {human(rate)}/s)"
+                raise RuntimeError(_msg(
+                    f"rclone melebihi batas waktu {timeout}s" + detail,
+                    f"rclone exceeded timeout {timeout}s" + detail))
         proc.wait(timeout=30)
     finally:
         if entry and proc in entry["procs"]:
@@ -1562,6 +1609,35 @@ def next_run(job, last_run, now):
 
 # ---------------------------------------------------------------- eksekusi
 
+ORPHAN_AFTER = 600      # detik tanpa heartbeat sebelum run dianggap mati
+HEARTBEAT_INTERVAL = 60
+
+
+def _heartbeat(cfg, run_id, stop):
+    """Beri tanda hidup berkala selama run berjalan.
+
+    Dibuka koneksi sendiri: koneksi sqlite tidak boleh dipakai lintas thread.
+    Update hanya menyentuh kolom heartbeat; kalau run sudah ditutup proses lain
+    (`finished` terisi), UPDATE tidak melakukan apa pun.
+    """
+    con = None
+    try:
+        con = connect(cfg)
+        while not stop.wait(HEARTBEAT_INTERVAL):
+            try:
+                con.execute("UPDATE runs SET heartbeat=? WHERE id=? AND finished IS NULL",
+                            (datetime.now().isoformat(), run_id))
+                con.commit()
+            except sqlite3.Error:
+                pass
+    except Exception:
+        # heartbeat hanya penjaga; kegagalannya tidak boleh menghentikan backup
+        pass
+    finally:
+        if con is not None:
+            con.close()
+
+
 def claim_run(con, job, started):
     """Daftarkan run baru sebagai 'running', atau tolak kalau job masih berjalan.
 
@@ -1569,8 +1645,9 @@ def claim_run(con, job, started):
     berbeda, jadi penjaga di memori (CANCEL) tidak saling melihat. BEGIN IMMEDIATE
     membuat cek-dan-insert atomik antar proses.
 
-    Baris yatim (proses mati tanpa menutup run) lebih tua dari timeout job dianggap
-    mati dan ditutup sebagai gagal, supaya tidak memblokir selamanya.
+    Baris yatim (proses mati tanpa menutup run) dikenali dari heartbeat yang basi,
+    BUKAN dari umur run. Upload ke cloud bisa lebih lama dari timeout dump; dulu
+    run panjang dianggap mati sehingga job kedua bisa berjalan bersamaan.
 
     Mengembalikan run_id, atau None kalau job masih berjalan.
     """
@@ -1579,15 +1656,15 @@ def claim_run(con, job, started):
         con.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError:
         return None     # database sedang dikunci proses lain yang memulai run
-    row = con.execute("SELECT id, started FROM runs WHERE job=? AND finished IS NULL "
-                      "ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    row = con.execute("SELECT id, COALESCE(heartbeat, started) FROM runs "
+                      "WHERE job=? AND finished IS NULL ORDER BY id DESC LIMIT 1",
+                      (name,)).fetchone()
     if row:
-        timeout = int(job.get("timeout") or 3600) + 600
         try:
             age = (datetime.now() - datetime.fromisoformat(row[1])).total_seconds()
         except (TypeError, ValueError):
-            age = timeout
-        if age < timeout:
+            age = ORPHAN_AFTER
+        if age < ORPHAN_AFTER:
             con.rollback()
             return None
         con.execute("UPDATE runs SET finished=?, status='failed', error=?, "
@@ -1595,8 +1672,10 @@ def claim_run(con, job, started):
                     (started.isoformat(), "terputus: proses sebelumnya tidak menutup run",
                      f"\n[{started:%Y-%m-%d %H:%M:%S}] GAGAL: run sebelumnya putus, "
                      f"ditandai gagal sebelum run baru dimulai", row[0]))
-    run_id = con.execute("INSERT INTO runs(job, started, status) VALUES(?,?,?)",
-                         (name, started.isoformat(), "running")).lastrowid
+    run_id = con.execute("INSERT INTO runs(job, started, heartbeat, status) "
+                         "VALUES(?,?,?,?)",
+                         (name, started.isoformat(), started.isoformat(),
+                          "running")).lastrowid
     con.commit()
     return run_id
 
@@ -1606,6 +1685,10 @@ def run_job(cfg, job, con, trigger="schedule"):
     started = datetime.now()
     run_id = claim_run(con, job, started)
     if run_id is None:
+        # klaim gagal: entri CANCEL didaftarkan pemanggil sebelum thread mulai,
+        # jadi harus dilepas di sini. Kalau tidak, job ini dianggap berjalan
+        # selamanya oleh proses ini dan tombol Backup terus ditolak.
+        CANCEL.pop(name, None)
         return None     # job ini masih berjalan (proses lain atau thread lain)
 
     tmp_dir = data_dir(cfg) / "tmp"
@@ -1628,6 +1711,10 @@ def run_job(cfg, job, con, trigger="schedule"):
     check_cancelled(name)
     sampler_stop = threading.Event()
     sampler = None
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat, args=(cfg, run_id, heartbeat_stop), daemon=True)
+    heartbeat_thread.start()
 
     try:
         log_line(f"mulai {name} ({trigger}) tipe={job['type']}")
@@ -1691,6 +1778,8 @@ def run_job(cfg, job, con, trigger="schedule"):
         sampler_stop.set()
         if sampler:
             sampler.join(timeout=2)
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
         # job gagal/dibatalkan bisa meninggalkan arsip separuh. Buang, supaya tidak
         # ada yang mengira itu backup yang sah. Yang sudah terkirim tidak disentuh.
         for p in [*produced, out]:
@@ -2203,27 +2292,40 @@ def _stamp_of(filename, job_name):
 
 
 def reconcile_runs(con):
-    """Tandai run 'running' yang thread-nya sudah tidak ada sebagai gagal.
+    """Tandai run 'running' yang prosesnya sudah tidak ada sebagai gagal.
 
-    Run dijalankan thread di dalam proses dashboard. Kalau dashboard di-restart
-    saat backup berjalan, barisnya tertinggal 'running' selamanya: dashboard
-    menampilkan "berjalan" dan tombol Backup ditolak ("job ini sedang berjalan"),
-    padahal tidak ada proses apa pun. Dipanggil sekali saat dashboard start.
+    Dashboard di-restart saat backup berjalan -> barisnya tertinggal 'running'
+    selamanya. Dulu SEMUA baris unfinished dimatikan saat start, padahal run bisa
+    dimiliki proses lain yang masih hidup (timer `tick`, `run` dari CLI). Sekarang
+    hanya run tanpa heartbeat segar yang dianggap yatim, aturan yang sama dengan
+    claim_run. Dipanggil sekali saat dashboard start.
     """
-    rows = con.execute("SELECT id, job FROM runs WHERE finished IS NULL").fetchall()
+    rows = con.execute("SELECT id, job, COALESCE(heartbeat, started) FROM runs "
+                       "WHERE finished IS NULL").fetchall()
     if not rows:
         return 0
-    now = datetime.now().isoformat()
-    for run_id, job in rows:
+    now = datetime.now()
+    stale = []
+    for run_id, job, beat in rows:
+        try:
+            age = (now - datetime.fromisoformat(beat)).total_seconds()
+        except (TypeError, ValueError):
+            age = ORPHAN_AFTER
+        if age >= ORPHAN_AFTER:
+            stale.append((run_id, job))
+    if not stale:
+        return 0
+    stamp = now.isoformat()
+    for run_id, job in stale:
         con.execute("UPDATE runs SET finished=?, status='failed', "
-                    "error='terputus: dashboard di-restart saat backup berjalan', "
+                    "error='terputus: proses pemilik run sudah berhenti', "
                     "log=COALESCE(log,'') || ? WHERE id=?",
-                    (now, f"\n[{now}] GAGAL: proses dashboard berhenti saat run ini "
-                          f"berjalan (run yatim setelah restart)", run_id))
+                    (stamp, f"\n[{stamp[:19].replace('T', ' ')}] GAGAL: run yatim — proses "
+                            f"pemiliknya sudah berhenti (tidak ada heartbeat)", run_id))
         con.execute("DELETE FROM state WHERE job=?", (job,))
     con.commit()
-    log_line(f"reconcile: {len(rows)} run yatim ditandai gagal")
-    return len(rows)
+    log_line(f"reconcile: {len(stale)} run yatim ditandai gagal")
+    return len(stale)
 
 
 def cleanup_orphan_tmp(cfg):
@@ -3122,6 +3224,8 @@ const DYN = [
   [/^· (\\d+) berkas · ([\\d.,]+ \\w+)$/, m => '· ' + m[1] + ' files · ' + m[2]],
   [/^(\\d+) berkas tidak bisa dibaca dan dilewati: (.*)$/,
     m => m[1] + ' unreadable files skipped: ' + m[2]],
+  [/^(.+): rclone melebihi batas waktu (\\d+)s$/,
+    m => m[1] + ': rclone exceeded timeout ' + m[2] + 's'],
   [/^(\\d+) hari lalu$/, m => m[1] + ' days ago'],
   [/^(\\d+) jam lalu$/, m => m[1] + ' hours ago'],
   [/^(\\d+) menit lalu$/, m => m[1] + ' minutes ago'],

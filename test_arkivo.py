@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -354,6 +355,46 @@ with tempfile.TemporaryDirectory() as td:
     check("klaim: run yatim ditandai gagal",
           con.execute("SELECT status FROM runs WHERE job='jstale' AND id!=?",
                       (rid_stale,)).fetchone()[0] == "failed")
+    # upload lambat bisa berjam-jam: run lama TIDAK boleh dianggap yatim selama
+    # heartbeat-nya masih segar. Tanpa ini, klik Backup dari dashboard bisa
+    # menjalankan job kedua saat run pertama masih mengunggah.
+    job_long = {"name": "jlong", "type": "path", "timeout": 10}
+    rid_long = arkivo.claim_run(con, job_long, datetime.now() - timedelta(hours=2))
+    con.execute("UPDATE runs SET heartbeat=? WHERE id=?",
+                (datetime.now().isoformat(), rid_long))
+    con.commit()
+    check("klaim: run panjang dengan heartbeat segar tidak diambil alih",
+          arkivo.claim_run(con, job_long, datetime.now()) is None)
+    con.execute("UPDATE runs SET finished=?, status='success' WHERE id=?",
+                (datetime.now().isoformat(), rid_long))
+    con.commit()
+    # heartbeat basi = proses benar-benar mati: boleh diambil alih
+    job_hb = {"name": "jhb", "type": "path", "timeout": 10}
+    rid_hb = arkivo.claim_run(con, job_hb, datetime.now() - timedelta(hours=2))
+    con.execute("UPDATE runs SET heartbeat=? WHERE id=?",
+                ((datetime.now() - timedelta(hours=2)).isoformat(), rid_hb))
+    con.commit()
+    rid_hb_new = arkivo.claim_run(con, job_hb, datetime.now())
+    check("klaim: heartbeat basi boleh diambil alih", rid_hb_new is not None)
+    check("klaim: heartbeat basi ditandai gagal",
+          con.execute("SELECT status FROM runs WHERE job='jhb' AND id!=?",
+                      (rid_hb_new,)).fetchone()[0] == "failed")
+    # klaim gagal tidak boleh meninggalkan penanda "sedang berjalan" di memori,
+    # kalau tidak job itu tidak bisa dijalankan lagi dari dashboard
+    busy = {"name": "jbusy", "type": "path", "path": td, "schedule": "manual"}
+    con.execute("INSERT INTO runs(job,started,heartbeat,status) "
+                "VALUES('jbusy',?,?,'running')",
+                (datetime.now().isoformat(),) * 2)
+    con.commit()
+    arkivo.start_job_thread(dict(cfg, job=[busy]), busy)
+    for _ in range(100):
+        if "jbusy" not in arkivo.CANCEL:
+            break
+        time.sleep(0.02)
+    check("klaim gagal: penanda berjalan dilepas", "jbusy" not in arkivo.CANCEL)
+    con.execute("UPDATE runs SET finished=?, status='success' WHERE job='jbusy'",
+                (datetime.now().isoformat(),))
+    con.commit()
     job, err = arkivo.validate_job({"name": "dari-dashboard", "type": "path", "path": td})
     check("validasi job baru", err is None, err or "")
     check("simpan job baru", arkivo.upsert_db_job(con, "dari-dashboard", job) is None)
@@ -501,17 +542,22 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     cfg = {"general": {"data_dir": Path(td)}, "targets": [], "job": [], "telegram": {}}
     con = arkivo.connect(cfg)
-    con.execute("INSERT INTO runs(job, started, status) VALUES('jx', ?, 'running')",
-                (datetime.now().isoformat(),))
-    con.execute("INSERT INTO state(job, last_run) VALUES('jx', ?)",
-                (datetime.now().isoformat(),))
+    old = (datetime.now() - timedelta(hours=1)).isoformat()
+    con.execute("INSERT INTO runs(job, started, heartbeat, status) "
+                "VALUES('jx', ?, ?, 'running')", (old, old))
+    con.execute("INSERT INTO state(job, last_run) VALUES('jx', ?)", (old,))
+    # run milik proses lain (timer/CLI) yang masih hidup: heartbeat segar
+    con.execute("INSERT INTO runs(job, started, heartbeat, status) VALUES('hidup', ?, ?, "
+                "'running')", (old, datetime.now().isoformat()))
     con.commit()
     n = arkivo.reconcile_runs(con)
     row = con.execute("SELECT status, finished, error, log FROM runs WHERE job='jx'").fetchone()
     check("reconcile: run yatim ditandai gagal", n == 1 and row[0] == "failed", str(row))
     check("reconcile: finished diisi", row[1] is not None)
-    check("reconcile: error menjelaskan sebab", "restart" in (row[2] or ""), str(row[2]))
+    check("reconcile: error menjelaskan sebab", "berhenti" in (row[2] or ""), str(row[2]))
     check("reconcile: log menyebut run yatim", "yatim" in (row[3] or ""), str(row[3]))
+    check("reconcile: run dengan heartbeat segar tidak disentuh",
+          con.execute("SELECT status FROM runs WHERE job='hidup'").fetchone()[0] == "running")
     check("reconcile: state tidak diklaim berjalan",
           con.execute("SELECT COUNT(*) FROM state WHERE job='jx'").fetchone()[0] == 0)
     check("reconcile: idempoten", arkivo.reconcile_runs(con) == 0)
@@ -559,6 +605,9 @@ check("log EN: selesai", arkivo.translate_log("selesai: success (8s)")
       == "finished: success (8s)")
 check("log EN: keluaran tool dibiarkan", arkivo.translate_log("tar: removing leading /")
       == "tar: removing leading /")
+check("log EN: rclone timeout ikut diterjemahkan", arkivo.translate_log(
+    "GAGAL target Google Drive: rclone melebihi batas waktu 7200s")
+      == "FAILED target Google Drive: rclone exceeded timeout 7200s")
 arkivo._log_ctx.buf = lb2 = []
 arkivo._log_ctx.lang = "en"
 arkivo.log_line("dump selesai: 1.2MB")
@@ -574,6 +623,35 @@ for line, want in (("  1.234 MiB / 10 MiB, 12%, 1.5 MiB/s, ETA 5s", 1293942),
                    ("* file.dump: 100% done, 1.0 MiB/s", 0)):
     got = arkivo._bytes_of(line)
     check(f"rclone stats: {line.strip()[:28]}", abs(got - want) <= 1, f"{got} != {want}")
+
+# batas upload terpisah dari timeout dump: GDrive lambat bisa lebih dari 2 jam
+check("upload timeout: default 6 jam", arkivo.upload_timeout({}, {}) == 6 * 3600)
+check("upload timeout: dari general",
+      arkivo.upload_timeout({"general": {"upload_timeout": 900}}, {}) == 900)
+check("upload timeout: target menang",
+      arkivo.upload_timeout({"general": {"upload_timeout": 900}},
+                            {"upload_timeout": 1800}) == 1800)
+check("upload timeout: nilai rusak -> default",
+      arkivo.upload_timeout({"general": {"upload_timeout": "abc"}},
+                            {"upload_timeout": -5}) == 6 * 3600)
+
+# Pesan timeout rclone harus mengikuti bahasa yang dipilih. Proses palsu menulis
+# statistik terus supaya deadline benar-benar terpicu di dalam loop pembacaan.
+fake_rclone = ("import sys, time\n"
+               "while True:\n"
+               " print('Transferred: 1.0 MiB / 10 MiB, 10%, 1.0 MiB/s',\n"
+               "       file=sys.stderr, flush=True)\n"
+               " time.sleep(0.02)\n")
+for lang, want in (("en", "exceeded"), ("id", "melebihi")):
+    arkivo._log_ctx.lang = lang
+    try:
+        arkivo._run_rclone([sys.executable, "-c", fake_rclone], "job-timeout", 0.15)
+        msg = ""
+    except RuntimeError as exc:
+        msg = str(exc)
+    finally:
+        arkivo._log_ctx.lang = None
+    check(f"rclone timeout: pesan {lang}", want in msg, msg)
 
 # --- rahasia arkivo tidak boleh ikut ter-backup -------------------------
 # config.toml / data/secrets.json / data/state.db memuat password. Kalau ikut

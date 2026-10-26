@@ -3,6 +3,7 @@
 data_dir = "/var/www/arkivo/data"   # state.db, tmp, dan target lokal default
 retention_days = 14                    # default kalau job tidak set sendiri
 min_free_percent = 15                  # notif kalau storage target sisa di bawah ini
+upload_timeout = 21600                 # batas upload per berkas per target (6 jam)
 dashboard_port = 8787
 dashboard_host = "127.0.0.1"           # jangan diubah kecuali di belakang reverse proxy
 dashboard_token = ""                   # kosong = dibuat acak tiap start
@@ -25,6 +26,7 @@ path = "/var/www/arkivo/data/local"
 name = "Google Drive"
 type = "rclone"
 path = "gdrive:backup/server1"         # remote rclone, sudah ada di mesin ini
+# upload_timeout = 43200               # opsional: naikkan untuk uplink lambat
 enabled = false
 
 [[targets]]

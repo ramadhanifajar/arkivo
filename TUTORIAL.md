@@ -102,6 +102,7 @@ nano config.toml
 data_dir = "/var/www/arkivo/data"   # state.db, penampungan sementara
 retention_days = 14                    # umur arsip sebelum dihapus otomatis
 min_free_percent = 15                  # peringatan kalau sisa disk di bawah ini
+upload_timeout = 21600                 # batas upload per berkas per target (6 jam)
 dashboard_port = 8787
 dashboard_host = "127.0.0.1"           # biarkan localhost
 dashboard_token = ""                   # diisi otomatis oleh installer
@@ -410,6 +411,21 @@ Pakai `_netdev` supaya sistem menunggu jaringan siap sebelum me-mount.
 
 Retensi berjalan otomatis di setiap target: arsip lebih tua dari
 `retention_days` dihapus.
+
+`upload_timeout` di `[general]` (default 6 jam) membatasi lama upload **satu
+berkas ke satu target**. Target yang uplink-nya lambat, misalnya Google Drive,
+bisa punya nilai sendiri:
+
+```toml
+[[targets]]
+name = "Google Drive"
+type = "rclone"
+path = "gdrive:backup/server1"
+upload_timeout = 43200        # 12 jam untuk arsip besar di uplink lambat
+```
+
+Nilai ini terpisah dari `timeout` pada `[[job]]`, yang membatasi proses dump
+database. Jangan menurunkan `upload_timeout` hanya karena dump-nya cepat.
 
 ---
 
