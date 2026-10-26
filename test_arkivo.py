@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Self-check: python3 test_arkivo.py"""
 import ast
+import collections
 import os
 import re
 import shutil
@@ -913,6 +914,21 @@ if ex.exists():
     check("semua tipe job didukung",
           all(jobbl["type"] in arkivo.DUMPERS for jobbl in parsed["job"]),
           str([j["type"] for j in parsed["job"]]))
+
+# --- kamus i18n: cegah loop dan kunci ganda -------------------------------
+# Teks sudah diterjemahkan masih dicocokkan ulang oleh MutationObserver. Kalau
+# nilai terjemahan kebetulan juga kunci yang memetakan ke teks lain, tampilan
+# berubah bolak-balik. Pernah terjadi dua kali; dikunci di sini.
+src_js = arkivo_source = Path(arkivo.__file__).read_text(encoding="utf-8")
+i18n = src_js[src_js.index("const ID2EN = {"):src_js.index("// teks ber-interpolasi")]
+pairs = re.findall(r"^  '((?:[^'\\]|\\.)*)':\s*'((?:[^'\\]|\\.)*)'", i18n, re.M)
+mapping = dict(pairs)
+check("kamus i18n terbaca", len(mapping) > 100, str(len(mapping)))
+dupes = [k for k, c in collections.Counter(k for k, _ in pairs).items() if c > 1]
+check("kamus i18n tanpa kunci ganda", not dupes, str(dupes))
+loops = [(k, v, mapping[v]) for k, v in mapping.items()
+         if v in mapping and mapping[v] != v]
+check("kamus i18n tanpa rantai terjemahan", not loops, str(loops[:3]))
 
 print()
 if FAILED:

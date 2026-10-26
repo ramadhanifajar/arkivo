@@ -3049,7 +3049,6 @@ const ID2EN = {
   'tidak ada arsip yang cocok': 'no matching archives',
 
   // --- dialog
-  'Tambah job': 'Add job',
   'Identitas': 'Identity',
   'Nama job': 'Job name',
   'Tipe': 'Type',
@@ -3080,12 +3079,30 @@ const ID2EN = {
   'Hapus arsip?': 'Delete archive?',
   'Hapus job?': 'Delete job?',
   'Hapus password?': 'Remove password?',
+  'Hapus riwayat?': 'Delete history entry?',
+  'Hapus riwayat gagal?': 'Delete failed history?',
+  'Hapus riwayat': 'Delete entry',
+  'Hapus yang gagal': 'Delete failed',
   'Jalankan backup?': 'Run backup?',
+  'Satu baris riwayat run akan dihapus.':
+    'One run history entry will be deleted.',
+  'Arsip yang sudah tersimpan tidak ikut terhapus. Log run ini juga hilang.':
+    'Existing archives are kept. This run log is lost too.',
+  'Arsip yang sudah tersimpan tidak ikut terhapus.':
+    'Existing archives are kept.',
+  'Baris riwayat berstatus gagal akan dihapus.':
+    'Failed history entries will be deleted.',
 
   // --- pesan
   'Arsip dihapus.': 'Archive deleted.',
   'Password dihapus.': 'Password removed.',
   'Job tersimpan.': 'Job saved.',
+  'Job dihapus.': 'Job deleted.',
+  'Riwayat dihapus.': 'History deleted.',
+  'Tersimpan.': 'Saved.',
+  'Tersimpan': 'Saved',
+  'Perintah restore disalin.': 'Restore command copied.',
+  'Jalankan backup': 'Run backup',
   'Job tidak ditemukan.': 'Job not found.',
   'Target tidak ditemukan.': 'Target not found.',
   'Perubahan tersimpan.': 'Changes saved.',
@@ -3139,7 +3156,6 @@ const ID2EN = {
   'Arsip tersimpan': 'Stored archives',
   'Keberhasilan': 'Success rate',
   'Aktivitas': 'Activity',
-  'Berkas': 'Files',
   'berkas': 'files',
   'Arsip ini': 'This archive',
   'Arsip di riwayat': 'Archives in history',
@@ -3148,7 +3164,10 @@ const ID2EN = {
   'Cara membuka arsip .tar.zst': 'How to open a .tar.zst archive',
   'Termudah: 7-Zip': 'Easiest: 7-Zip',
   'Arsip besar butuh waktu —': 'Large archives take time —',
+  'Password · ': 'Password · ',
+  'Cara membuka · ': 'How to open · ',
   'Verifikasi arsip · ': 'Archive verification · ',
+  'Uji koneksi · ': 'Test connection · ',
   'Verifikasi arsip: periksa isinya masih bisa dipulihkan':
     'Archive verification: check the contents are still restorable',
   'Proses · ': 'Process · ',
@@ -3156,7 +3175,6 @@ const ID2EN = {
   'Arsip · ': 'Archive · ',
   'Edit job · ': 'Edit job · ',
   'Edit target · ': 'Edit target · ',
-  'Uji koneksi · ': 'Test connection · ',
   'Diagnostik · ': 'Diagnostics · ',
   'Backup dimulai: ': 'Backup started: ',
   'Gagal: ': 'Failed: ',
@@ -3170,13 +3188,11 @@ const ID2EN = {
   ' dihentikan.': ' stopped.',
   ' sedang tidak berjalan.': ' is not running.',
   'Password untuk job "': 'Password for job "',
-  ' akan dihapus.': ' will be removed.',
   'sisa ruang target': 'target free space',
   'run terakhir': 'latest runs',
   '60 run terakhir': 'last 60 runs',
   'run gagal terakhir': 'latest failed runs',
   'job aktif': 'active jobs',
-  '60 run terakhir': 'last 60 runs',
   'bebas dari': 'free of',
   'bebas total': 'free in total',
   'tar dikompresi zstd': 'zstd-compressed tar',
@@ -3245,6 +3261,21 @@ const DYN = [
   [/^Kirim notifikasi$/, () => 'Send notifications'],
   [/^Token tersimpan \\((.*)\\)\\. Nilai token tidak pernah ditampilkan kembali\\.$/,
     m => 'Token stored (' + m[1] + '). The token is never shown again.'],
+  // pesan ber-interpolasi (nama job, jumlah baris)
+  [/^Job "(.*)" akan dihapus dari dashboard\\.$/, m => 'Job "' + m[1] + '" will be deleted from the dashboard.'],
+  [/^Backup "(.*)" akan dijalankan sekarang di server\\.$/, m => 'Backup "' + m[1] + '" will run now on the server.'],
+  [/^Password untuk job "(.*)" akan dihapus\\.$/, m => 'Password for job "' + m[1] + '" will be removed.'],
+  [/^Job "(.*)" dihentikan\\.$/, m => 'Job "' + m[1] + '" stopped.'],
+  [/^Job "(.*)" sedang tidak berjalan\\.$/, m => 'Job "' + m[1] + '" is not running.'],
+  [/^(\\d+) baris riwayat berstatus gagal akan dihapus\\.$/, m => m[1] + ' failed history entries will be deleted.'],
+  [/^Hapus (\\d+) run$/, m => 'Delete ' + m[1] + ' runs'],
+  [/^(\\d+) riwayat dihapus\\.$/, m => m[1] + ' history entries deleted.'],
+  [/^Backup dimulai: (.*)$/, m => 'Backup started: ' + m[1]],
+  [/^Gagal: (.*)$/, m => 'Failed: ' + m[1]],
+  [/^Gagal menghapus: (.*)$/, m => 'Failed to delete: ' + m[1]],
+  [/^Gagal menyimpan: (.*)$/, m => 'Failed to save: ' + m[1]],
+  [/^Gagal mengirim$/, () => 'Failed to send'],
+  [/^Mengunduh (.*)…$/, m => 'Downloading ' + m[1] + '…'],
 ];
 const PHASE_EN = {menyiapkan: 'preparing', menunggu: 'waiting', dump: 'dump',
                   unggah: 'uploading', verifikasi: 'verifying', selesai: 'done'};
@@ -3361,11 +3392,11 @@ function toast(msg){
 // bisa dimatikan browser. Mengembalikan Promise<boolean>.
 let askResolve = null;
 function confirmBox({title, msg, detail, ok, danger, icon}){
-  asktitle.textContent = title;
-  askmsg.textContent = msg || '';
-  askdetail.textContent = detail || '';
+  asktitle.textContent = tr(title);
+  askmsg.textContent = tr(msg || '');
+  askdetail.textContent = tr(detail || '');
   askdetail.hidden = !detail;
-  askyes.textContent = ok || 'Ya, lanjutkan';
+  askyes.textContent = tr(ok || 'Ya, lanjutkan');
   askyes.className = 'btn ' + (danger ? 'danger' : 'primary');
   askicon.className = 'askicon ' + (danger ? 'danger' : 'info');
   askicon.innerHTML = icon === 'trash'
@@ -3866,7 +3897,7 @@ function showText(text){
   dlgb.hidden = false; dlgb.textContent = text;
 }
 async function testJob(n){
-  dlgt.textContent = 'Uji koneksi · ' + n;
+  dlgt.textContent = tr('Uji koneksi · ') + n;
   showPane('<div class="resnote run"><i class="dot run"></i><div><b>Menguji koneksi…</b>' +
     '<div class=detail>Menghubungi sumber backup dengan pengaturan tersimpan.</div></div></div>');
   dlg.showModal();
@@ -3891,9 +3922,8 @@ async function delJob(n){
     body:JSON.stringify({name:n})})).json();
   if(!d.ok) toast('Gagal menghapus: '+(d.error||'')); else { toast('Job dihapus.'); tick(); }
 }
-async function showHelp(){
-  dlgt.textContent='Panduan singkat';
-  showText(`TAMBAH JOB
+const HELP = {
+id:`TAMBAH JOB
   Tombol "Tambah job". PostgreSQL/MySQL/MariaDB = backup database; "Project /
   file" untuk folder. Pilih "Server lain (SSH)" bila sumbernya di mesin lain,
   lalu isi ssh host/user (kunci SSH opsional).
@@ -3918,11 +3948,41 @@ JADWAL
 DIAGNOSTIK
   Memeriksa tool, versi pg_dump vs pg_restore, remote rclone, sisa disk,
   keutuhan state.db, dan sisa file sementara. "Uji arsip terbaru" membaca ulang
-  arsip untuk memastikan benar-benar bisa dipulihkan.`);
+  arsip untuk memastikan benar-benar bisa dipulihkan.`,
+en:`ADD A JOB
+  "Add job". PostgreSQL/MySQL/MariaDB backs up a database; "Project / file"
+  backs up a folder. Pick "Other server (SSH)" when the source lives on another
+  machine, then fill in the ssh host/user (SSH key optional).
+  Database passwords are set with the key button on the job row.
+
+ARCHIVES & RESTORE
+  Click a job name (or the Archives tab) to list every stored archive, newest
+  first. Filter by date when you need a specific day.
+  Download the archive, then restore:
+  Postgres: ./restore.sh pg <file> <db>
+  MySQL:    ./restore.sh my <file> [db]
+  File:     ./restore.sh tar <file> <dir>
+  The check button verifies the archive is still readable (zstd -t / pg_restore -l).
+
+SEVERAL DATABASES / SEVERAL SERVERS
+  Each job stands alone: one job can cover several databases (fill the Database
+  field with "app, crm"), and several jobs can point at different servers.
+
+SCHEDULE
+  manual | hourly | every30m | every6h | daily 02:00 | weekly 6 23:00  (6 = Saturday)
+
+DIAGNOSTICS
+  Checks tools, pg_dump vs pg_restore versions, rclone remotes, free disk,
+  state.db integrity, and leftover temporary files. "Verify latest archive"
+  reads the archive back to prove it can actually be restored.`
+};
+async function showHelp(){
+  dlgt.textContent = LANG === 'en' ? 'Quick guide' : 'Panduan singkat';
+  showText(HELP[LANG === 'en' ? 'en' : 'id']);
   dlg.showModal();
 }
 async function pwDialog(n, has){
-  dlgt.textContent = 'Password · ' + n;
+  dlgt.textContent = tr('Password · ') + n;
   showPane(`<p class=dim style="margin:0 0 12px;font-size:12.5px">Nilai tersimpan tidak
      pernah ditampilkan kembali. Mengosongkan lalu simpan akan menghapus password.</p>
      <p style="margin:0 0 14px;font-size:13px">Status:
@@ -4024,7 +4084,7 @@ async function delFailed(){
 }
 async function verifyArt(f, bytes){
   const name = f.split('/').pop();
-  dlgt.textContent = 'Verifikasi arsip · ' + name;
+  dlgt.textContent = tr('Verifikasi arsip · ') + name;
   const prefix = f.endsWith('.dump')
     ? `${fmtBytes(bytes)} — pg_restore -l hanya membaca daftar isi, biasanya di bawah 1 detik.`
     : `${fmtBytes(bytes)} — .tar.zst harus didekompresi penuh, jadi waktunya sebanding ukuran.`;
@@ -4183,7 +4243,7 @@ function copyCmd(job, i){
   copyText(restoreCmd(a.name));
 }
 function openHow(name){
-  dlgt.textContent = 'Cara membuka · ' + name;
+  dlgt.textContent = tr('Cara membuka · ') + name;
   const base = name.replace('.zst', '');
   showPane(`<div class=howto>
     <p>Arsip ini <b>tar dikompresi zstd</b>. Klik dua kali tidak cukup di
